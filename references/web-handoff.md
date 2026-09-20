@@ -23,7 +23,7 @@ web_handoff/
 ├── pages/                 # 可直接上传的页面图（PNG，超限时降级为 JPEG）
 │   ├── <来源>-p01.png
 │   └── <来源>-p02.png
-├── context_pack.md        # 带来源路径与页码的文本摘录（文本源 / PDF 文本层）
+├── context_pack.md        # 带来源文件名与页码的文本摘录（不含本地路径，可直接上传）
 ├── upload_manifest.md     # 上传清单：Priority / 文件名 / 本地路径 / 大小 / 用途 / 准备
 ├── web_prompt.md          # 由 agent 撰写的粘贴用 prompt（不做成模板文件）
 └── handoff.json           # 机器可读摘要，供 agent 与后续复用读取
@@ -31,6 +31,9 @@ web_handoff/
 
 机械转换（渲染、缩放、体积控制、清单、文本抽取）交给 `scripts/render_upload_pages.py`；
 `web_prompt.md` 必须由 agent 依清单与 `context_pack.md` 撰写，脚本不生成它。
+
+**可上传与不可上传**：`pages/` 与 `context_pack.md` 可以上传（`context_pack.md` 刻意不含本地绝对路径）；
+`upload_manifest.md` 与 `handoff.json` **含本地绝对路径，仅供本地使用，绝不粘贴或上传给网页端**。
 
 ```bash
 python3 scripts/render_upload_pages.py <来源文件...> \

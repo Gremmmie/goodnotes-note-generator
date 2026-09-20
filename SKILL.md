@@ -107,6 +107,7 @@ Workflow:
 Rules:
 - Never put local absolute paths in the web prompt. Refer only to uploaded filenames.
 - Uploaded page images are source material for reading, not layouts to copy. Say so explicitly in the prompt when images are supplied.
+- Never upload `upload_manifest.md` or `handoff.json`: they carry local absolute paths and are for local use only. `context_pack.md` is deliberately path-free and may be uploaded.
 - Keep the default budget (≤ 5 files, ≤ 5 MB each, long edge ≤ 2000 px) unless the user gives a different cap; degrade gracefully and record anything left out.
 - Do not upload secrets, credentials, personal data, or restricted material. Reuse the safety, context-pack, and manifest conventions from the `web-ai-handoff` skill instead of restating them.
 - Read `references/web-handoff.md` for the bundle layout, budget degradation order, quality checklist, and failure fixes.
@@ -128,3 +129,4 @@ Before finalizing, verify all of the following:
 - Use `references/output-patterns.md` to choose page archetypes and structure content efficiently.
 - Use `references/web-handoff.md` when the images are generated in a browser-based chat; it defines the handoff bundle, the paste-ready prompt structure, and the upload budget.
 - Use `scripts/render_upload_pages.py` to render local sources into upload-ready page images plus an upload manifest.
+- Run `python3 -m unittest discover -s tests -v` after changing the script or this file; `tests/` also enforces package hygiene (frontmatter validity, description length and trigger placement, resource references, no leaked local paths or credentials).

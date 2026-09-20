@@ -21,6 +21,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -69,6 +70,33 @@ def slugify(name: str) -> str:
     return slug[:48] or "source"
 
 
+def unique_slug(name: str, taken: set[str]) -> str:
+    """Return a slug that no other source in this run has claimed.
+
+    Two sources can share a stem (paper.pdf and paper.png, or same-named files
+    from different folders); without this they would overwrite each other.
+    """
+    base = slugify(name)
+    slug = base
+    index = 2
+    while slug in taken:
+        slug = f"{base}-{index}"
+        index += 1
+    taken.add(slug)
+    return slug
+
+
+def safe_size(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def size_label(size: int | None) -> str:
+    return human_size(size) if size is not None else "—（源文件已不可读）"
+
+
 def require_tool(tool: str) -> str:
     path = shutil.which(tool)
     if not path:
@@ -81,12 +109,16 @@ def require_tool(tool: str) -> str:
 def run(cmd: list[str]) -> None:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise HandoffError(f"command failed: {' '.join(cmd)}\n{stderr}")
+        detail = (result.stderr or result.stdout or "").strip()
+        if len(detail) > 600:
+            detail = detail[:600] + " …（已截断）"
+        raise HandoffError(f"command failed ({Path(cmd[0]).name}, exit {result.returncode}): {detail}")
 
 
 def resolve_out_dir(base: Path, requested: Path | None, force: bool) -> Path:
     out = (requested or (base / "web_handoff")).expanduser().resolve()
+    if out.exists() and not out.is_dir():
+        raise HandoffError(f"--out must be a directory, but this path is a file: {out}")
     if force or not out.exists() or not any(out.iterdir()):
         return out
     index = 2
@@ -125,7 +157,9 @@ def write_jpeg(image, path: Path, quality: int) -> None:
 
 
 def scaled(image, long_edge: int, factor: float):
-    edge = max(MIN_LONG_EDGE, int(long_edge * factor))
+    # Never let the soft floor override a deliberately smaller --long-edge.
+    floor = min(MIN_LONG_EDGE, long_edge)
+    edge = max(floor, int(long_edge * factor))
     candidate = image.copy()
     if max(candidate.size) > edge:
         candidate.thumbnail((edge, edge), Image.LANCZOS)
@@ -209,57 +243,64 @@ def pdf_page_count(src: Path) -> int | None:
 
 
 def render_pdf(
-    src: Path, pages_dir: Path, long_edge: int, max_bytes: int, max_pages: int
+    src: Path,
+    pages_dir: Path,
+    slug: str,
+    long_edge: int,
+    max_bytes: int,
+    max_pages: int,
 ) -> tuple[list[dict], str, int]:
     pdftoppm = require_tool("pdftoppm")
-    slug = slugify(src.stem)
-    work_dir = pages_dir / f".tmp_{slug}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    prefix = work_dir / "page"
-    run(
-        [
-            pdftoppm,
-            "-png",
-            "-scale-to",
-            str(long_edge),
-            "-l",
-            str(max_pages),
-            str(src),
-            str(prefix),
-        ]
-    )
-
-    rendered = sorted(work_dir.glob("page*.png"))
-    if not rendered:
-        raise HandoffError(f"pdftoppm produced no pages for {src}")
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix=".tmp_", dir=pages_dir))
 
     entries: list[dict] = []
-    for index, raw in enumerate(rendered, start=1):
-        dest = pages_dir / f"{slug}-p{index:02d}.png"
-        with Image.open(raw) as image:
-            info = save_png(image, dest, long_edge, max_bytes)
-        info.update(
-            page=index,
-            source=src,
-            upload_name=info["path"].name,
-            purpose=f"{src.name} 第 {index} 页原页图（供网页端读图后据此出笔记图）",
-            priority=1,
-            tier="must",
-            preparation="无需处理，作为图片直接上传",
+    try:
+        prefix = work_dir / "page"
+        run(
+            [
+                pdftoppm,
+                "-png",
+                "-scale-to",
+                str(long_edge),
+                "-l",
+                str(max_pages),
+                str(src),
+                str(prefix),
+            ]
         )
-        entries.append(info)
 
-    for leftover in work_dir.glob("*"):
-        leftover.unlink()
-    work_dir.rmdir()
+        rendered = sorted(work_dir.glob("page*.png"))
+        if not rendered:
+            raise HandoffError(f"pdftoppm produced no pages for {src}")
+
+        for index, raw in enumerate(rendered, start=1):
+            dest = pages_dir / f"{slug}-p{index:02d}.png"
+            with Image.open(raw) as image:
+                info = save_png(image, dest, long_edge, max_bytes)
+            info.update(
+                page=index,
+                source=src,
+                upload_name=info["path"].name,
+                purpose=f"{src.name} 第 {index} 页原页图（供网页端读图后据此出笔记图）",
+                priority=1,
+                tier="must",
+                preparation="无需处理，作为图片直接上传",
+            )
+            entries.append(info)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
     total_pages = pdf_page_count(src)
     omitted = max(0, total_pages - len(entries)) if total_pages else 0
     return entries, pdf_text(src), omitted
 
 
-def normalize_image(src: Path, pages_dir: Path, long_edge: int, max_bytes: int) -> dict:
-    dest = pages_dir / f"{slugify(src.stem)}.png"
+def normalize_image(
+    src: Path, pages_dir: Path, slug: str, long_edge: int, max_bytes: int
+) -> dict:
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    dest = pages_dir / f"{slug}.png"
     try:
         with Image.open(src) as image:
             info = save_png(image, dest, long_edge, max_bytes)
@@ -312,13 +353,13 @@ def build_context_pack(blocks: list[tuple[Path, str]]) -> tuple[str, bool]:
     ]
     used = 0
     truncated = False
-    for src, text in blocks:
+    for source_index, (src, text) in enumerate(blocks, start=1):
         if not text.strip():
             continue
         stripped = text.strip()
         if used >= CONTEXT_PACK_CHAR_BUDGET:
             truncated = True
-            lines += [f"## {src.name}", "", "（已达文本预算，本文件内容省略）", ""]
+            lines += [f"## [来源 {source_index}] {src.name}", "", "（已达文本预算，本文件内容省略）", ""]
             continue
         remaining = CONTEXT_PACK_CHAR_BUDGET - used
         if len(stripped) > remaining:
@@ -328,7 +369,7 @@ def build_context_pack(blocks: list[tuple[Path, str]]) -> tuple[str, bool]:
         else:
             note = ""
         used += len(stripped)
-        lines += [f"## {src.name}", f"来源文件：`{src.name}`", ""]
+        lines += [f"## [来源 {source_index}] {src.name}", f"来源文件：`{src.name}`", ""]
         for page_number, page_text in enumerate(stripped.split("\f"), start=1):
             body = page_text.strip()
             if not body:
@@ -352,6 +393,9 @@ def manifest_table(
         f"生成时间：{datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')}",
         f"上传预算：≤ {budget_files} 个文件，单文件 ≤ {max_mb:g} MB",
         f"本包必须上传：{sum(1 for entry in entries if entry['tier'] == 'must')} 个文件",
+        "",
+        "> 隐私提示：本清单与 `handoff.json` **含本地绝对路径**，仅供本地使用，不要上传给网页端；",
+        "> 需要上传的只有 `pages/` 里的页面图与（可选的）`context_pack.md`。",
         "",
         "| Priority | Upload filename | Local path | Size | Purpose | Preparation |",
         "| --- | --- | --- | --- | --- | --- |",
@@ -380,18 +424,20 @@ def manifest_table(
         else:
             purpose = "源文件全文，仅在网页端需要核对原文时上传"
         rows.append(
-            f"| 5 (optional) | `{src.name}` | `{src}` | {human_size(src.stat().st_size)} | "
+            f"| 5 (optional) | `{src.name}` | `{src}` | {size_label(safe_size(src))} | "
             f"{purpose} | 确认不含敏感信息 |"
         )
     if context_pack is not None:
         rows.append(
             f"| 2 (optional) | `{context_pack.name}` | `{context_pack}` | "
-            f"{human_size(context_pack.stat().st_size)} | "
+            f"{size_label(safe_size(context_pack))} | "
             "文本摘录，网页端无法读图或只接受文本时用它替代页面图（不含本地绝对路径） | 无需处理 |"
         )
     rows += [
         "| — (do not upload) | — | `.env`、密钥、凭据、未公开数据、含个人信息的附件 | — | "
         "安全边界 | 剔除，或用脱敏替代文本 |",
+        "| — (do not upload) | `upload_manifest.md`、`handoff.json` | 含本地绝对路径 | — | "
+        "隐私边界 | 仅本地使用，不要上传 |",
         "",
         "`must` = 必须上传；`optional` = 按需；`do not upload` = 明确禁止。",
         "",
@@ -408,8 +454,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     parser.add_argument("--max-mb", type=float, default=DEFAULT_MAX_MB)
     parser.add_argument("--long-edge", type=int, default=DEFAULT_LONG_EDGE)
-    parser.add_argument("--force", action="store_true", help="reuse the output directory")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="reuse the output directory even if it exists (may overwrite existing page images)",
+    )
     args = parser.parse_args(argv)
+
+    for flag, value, minimum in (
+        ("--max-files", args.max_files, 1),
+        ("--long-edge", args.long_edge, 200),
+    ):
+        if value < minimum:
+            print(f"error: {flag} must be >= {minimum} (got {value})", file=sys.stderr)
+            return 2
+    if args.max_mb <= 0:
+        print(f"error: --max-mb must be > 0 (got {args.max_mb:g})", file=sys.stderr)
+        return 2
 
     sources = [path.expanduser().resolve() for path in args.sources]
     for src in sources:
@@ -420,46 +481,55 @@ def main(argv: list[str] | None = None) -> int:
     max_bytes = int(args.max_mb * 1024 * 1024)
     try:
         out_dir = resolve_out_dir(sources[0].parent, args.out, args.force)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # pages/ is created lazily: a text-only run must not leave an empty directory.
         pages_dir = out_dir / "pages"
-        pages_dir.mkdir(parents=True, exist_ok=True)
 
         entries: list[dict] = []
         text_blocks: list[tuple[Path, str]] = []
         skipped: list[tuple[Path, str]] = []
         remaining = args.max_files
+        taken_slugs: set[str] = set()
 
         for src in sources:
             suffix = src.suffix.lower()
-            if suffix in PDF_EXT:
-                if remaining <= 0:
-                    skipped.append((src, f"超出 {args.max_files} 个上传文件预算，未纳入本包"))
-                    continue
-                pdf_entries, text, omitted = render_pdf(
-                    src, pages_dir, args.long_edge, max_bytes, remaining
-                )
-                entries.extend(pdf_entries)
-                remaining -= len(pdf_entries)
-                if omitted:
-                    skipped.append(
-                        (
-                            src,
-                            f"源 PDF 共 {len(pdf_entries) + omitted} 页，"
-                            f"按上传预算仅纳入前 {len(pdf_entries)} 页，其余 {omitted} 页未纳入本包",
-                        )
+            try:
+                if suffix in PDF_EXT:
+                    if remaining <= 0:
+                        skipped.append((src, f"超出 {args.max_files} 个上传文件预算，未纳入本包"))
+                        continue
+                    slug = unique_slug(src.stem, taken_slugs)
+                    pdf_entries, text, omitted = render_pdf(
+                        src, pages_dir, slug, args.long_edge, max_bytes, remaining
                     )
-                if text.strip():
-                    text_blocks.append((src, text))
-            elif suffix in IMAGE_EXT:
-                if remaining <= 0:
-                    skipped.append((src, f"超出 {args.max_files} 个上传文件预算，未纳入本包"))
-                    continue
-                entries.append(normalize_image(src, pages_dir, args.long_edge, max_bytes))
-                remaining -= 1
-            elif suffix in TEXT_EXT:
-                # 文本源不占用图片上传预算，它们进入 context_pack.md
-                text_blocks.append((src, read_text_source(src)))
-            else:
-                skipped.append((src, f"unsupported extension '{suffix or 'none'}'"))
+                    entries.extend(pdf_entries)
+                    remaining -= len(pdf_entries)
+                    if omitted:
+                        skipped.append(
+                            (
+                                src,
+                                f"源 PDF 共 {len(pdf_entries) + omitted} 页，"
+                                f"按上传预算仅纳入前 {len(pdf_entries)} 页，其余 {omitted} 页未纳入本包",
+                            )
+                        )
+                    if text.strip():
+                        text_blocks.append((src, text))
+                elif suffix in IMAGE_EXT:
+                    if remaining <= 0:
+                        skipped.append((src, f"超出 {args.max_files} 个上传文件预算，未纳入本包"))
+                        continue
+                    slug = unique_slug(src.stem, taken_slugs)
+                    entries.append(
+                        normalize_image(src, pages_dir, slug, args.long_edge, max_bytes)
+                    )
+                    remaining -= 1
+                elif suffix in TEXT_EXT:
+                    # 文本源不占用图片上传预算，它们进入 context_pack.md
+                    text_blocks.append((src, read_text_source(src)))
+                else:
+                    skipped.append((src, f"不支持的扩展名 '{suffix or 'none'}'"))
+            except Exception as exc:  # 单个源失败不拖垮整批，记录后继续
+                skipped.append((src, f"处理失败（{type(exc).__name__}）：{exc}"))
 
         if len(entries) > args.max_files:
             for entry in entries[args.max_files :]:
@@ -514,6 +584,8 @@ def main(argv: list[str] | None = None) -> int:
                 "context_pack 是文本交接物，页面图包是图像交接物；网页端出图只需其一即可，除非每页文案需要逐字锁定。",
                 "context_pack 为 null 时说明源材料没有可抽取的文本层（扫描件或纯栅格 PDF）：网页端只能靠上传的页面图读图，逐页文案必须由 agent 在本地完成压缩与锁定后写进 web_prompt.md。",
                 "over_budget_pages 非空时，需按 references/web-handoff.md 的降级顺序处理（合并页面、降分辨率、只传关键页），并在交付说明里点明。",
+                "upload_manifest.md 与 handoff.json 含本地绝对路径，仅供本地使用；不要上传给网页端。",
+                "skipped 非空时要在交付说明里逐条交代原因（超预算、损坏文件、扩展名不支持等），不要静默丢弃。",
             ],
         }
         (out_dir / "handoff.json").write_text(
@@ -521,11 +593,20 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+        if skipped:
+            print(
+                f"warning: {len(skipped)} 个来源未纳入本包，原因见 handoff.json 的 skipped 字段",
+                file=sys.stderr,
+            )
         if not entries and not context_pack_path:
             print("warning: nothing uploadable was produced", file=sys.stderr)
             return 1
         return 0
-    except HandoffError as exc:
+    except (HandoffError, OSError) as exc:
+        # OSError covers an unwritable --out, a vanished source, a full disk, …
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # 兜底：不以 traceback 形式把内部细节喷给使用者
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
