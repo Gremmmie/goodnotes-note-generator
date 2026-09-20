@@ -1,0 +1,5 @@
+interface:
+  display_name: "Goodnotes Note Generator"
+  short_description: "Turn source material into realistic Goodnotes-style note images, including web-chat handoff bundles."
+  brand_color: "#005087"
+  default_prompt: "Use $goodnotes-note-generator to turn my source material into realistic Goodnotes-style note images."

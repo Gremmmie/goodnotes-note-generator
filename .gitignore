@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# 交接包输出目录（由 scripts/render_upload_pages.py 生成，属使用者本地产物）
+web_handoff/
+web_handoff_*/
